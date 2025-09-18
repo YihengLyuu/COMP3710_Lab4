@@ -9,9 +9,9 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
 
 
-# ---------------------------
+# =========================
 #  Warmup + Cosine 调度器
-# ---------------------------
+# =========================
 class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
     def __init__(self, optimizer, warmup_epochs, max_epochs, last_epoch: int = -1):
         self.warmup_epochs = max(0, int(warmup_epochs))
@@ -29,105 +29,9 @@ class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
         return [base * 0.5 * (1.0 + math.cos(math.pi * t)) for base in self.base_lrs]
 
 
-# ---------------------------
-#  数据集：OASIS Keras 切片
-# ---------------------------
-def _list_png(dir_path):
-    names = []
-    if os.path.isdir(dir_path):
-        for n in os.listdir(dir_path):
-            if n.endswith(".png"):
-                names.append(n)
-    return sorted(names)
-
-def _pair_names(img_dir, msk_dir):
-    imgs = _list_png(img_dir)
-    msks = _list_png(msk_dir)
-    a = set(imgs)
-    b = set(msks)
-    both = sorted(list(a.intersection(b)))
-    if len(both) == 0:
-        raise RuntimeError(f"[E] 未找到同名成对 PNG：\n  images={img_dir}\n  masks={msk_dir}")
-    return both
-
-class OASISKerasSlices(Dataset):
-    """
-    结构：
-      root/
-        keras_png_slices_train/         (灰度图像)
-        keras_png_slices_seg_train/     (mask: 0/255 或 0/1)
-        keras_png_slices_validate/
-        keras_png_slices_seg_validate/
-        keras_png_slices_test/
-        keras_png_slices_seg_test/
-    """
-    def __init__(self, root, split="train", transform=None, num_classes=2):
-        self.root = root
-        self.split = split
-        self.transform = transform
-        self.num_classes = num_classes
-
-        if split == "train":
-            img_dir = os.path.join(root, "keras_png_slices_train")
-            msk_dir = os.path.join(root, "keras_png_slices_seg_train")
-        elif split == "val" or split == "validate":
-            img_dir = os.path.join(root, "keras_png_slices_validate")
-            msk_dir = os.path.join(root, "keras_png_slices_seg_validate")
-        else:
-            img_dir = os.path.join(root, "keras_png_slices_test")
-            msk_dir = os.path.join(root, "keras_png_slices_seg_test")
-
-        self.img_dir = img_dir
-        self.msk_dir = msk_dir
-        self.names = _pair_names(img_dir, msk_dir)
-
-    def __len__(self):
-        return len(self.names)
-
-    def __getitem__(self, idx):
-        name = self.names[idx]
-        ip = os.path.join(self.img_dir, name)
-        mp = os.path.join(self.msk_dir, name)
-
-        img = np.array(Image.open(ip)).astype(np.float32)  # (H,W)
-        msk = np.array(Image.open(mp)).astype(np.int64)    # (H,W)
-
-        # Z-score
-        m = float(img.mean()); s = float(img.std() + 1e-6)
-        img = (img - m) / s
-
-        # 二类分割：mask 归一化到 {0,1}
-        if self.num_classes == 2:
-            msk = (msk > 0).astype(np.int64)
-
-        # To Tensor
-        img = torch.from_numpy(img).unsqueeze(0)  # [1,H,W]
-        msk = torch.from_numpy(msk)               # [H,W] long
-
-        if self.transform:
-            img = self.transform(img)
-        return img, msk
-
-
-# ---------------------------
-#  简单的 Tensor 级增广/Resize
-# ---------------------------
-def make_tensor_augment(size):
-    class TensorAug(object):
-        def __init__(self, size): self.size = size
-        def __call__(self, t):
-            # t: [1,H,W]
-            t = F.interpolate(t.unsqueeze(0), size=(self.size, self.size),
-                              mode='bilinear', align_corners=False).squeeze(0)
-            if torch.rand(1).item() < 0.5:
-                t = torch.flip(t, dims=[2])  # 水平翻转
-            return t
-    return TensorAug(size)
-
-
-# ---------------------------
+# =========================
 #  UNet（简洁实现）
-# ---------------------------
+# =========================
 class ConvBNReLU(nn.Module):
     def __init__(self, c_in, c_out):
         super().__init__()
@@ -170,9 +74,9 @@ class UNet(nn.Module):
         return self.head(d1)  # [N,C,H,W] logits
 
 
-# ---------------------------
+# =========================
 #  Dice + CE 复合损失 & 评估
-# ---------------------------
+# =========================
 class DiceCELoss(nn.Module):
     def __init__(self, num_classes, ce_weight=None, dice_weight=1.0, ce_weight_lambda=1.0):
         super().__init__()
@@ -182,7 +86,7 @@ class DiceCELoss(nn.Module):
         self.cw = ce_weight_lambda
 
     def forward(self, logits, target):
-        ce = self.ce(logits, target)  # CE
+        ce = self.ce(logits, target)
         probs = torch.softmax(logits, dim=1)
         onehot = F.one_hot(target.clamp(min=0), self.num_classes).permute(0, 3, 1, 2).float()
         inter = (probs * onehot).sum(dim=(0, 2, 3)).sum()
@@ -196,7 +100,7 @@ def dice_per_class(logits, target, num_classes, eps=1e-6):
     onehot = F.one_hot(target.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
     inter = (probs * onehot).sum(dim=(0, 2, 3))
     denom = (probs + onehot).sum(dim=(0, 2, 3))
-    return (2 * inter + eps) / (denom + eps)  # [C]
+    return (2 * inter + eps) / (denom + eps)
 
 @torch.no_grad()
 def evaluate(model, loader, device, num_classes):
@@ -212,11 +116,10 @@ def evaluate(model, loader, device, num_classes):
     return (dices / max(count, 1)).mean().item()
 
 
-# ---------------------------
+# =========================
 #  可视化：叠图保存
-# ---------------------------
+# =========================
 def save_overlay(x, y_pred, y_true, out_png):
-    # x:[1,H,W], y_pred/y_true:[H,W]
     x = x.squeeze(0).cpu().numpy()
     y_pred = y_pred.cpu().numpy()
     y_true = y_true.cpu().numpy()
@@ -228,19 +131,156 @@ def save_overlay(x, y_pred, y_true, out_png):
     plt.tight_layout(); plt.savefig(out_png, dpi=180); plt.close()
 
 
-# ---------------------------
-#  DataLoader 构造
-# ---------------------------
-def get_loaders(data_root, num_classes, batch_size, workers, use_channels_last, img_size=256):
-    aug = make_tensor_augment(img_size)
-    ds_tr = OASISKerasSlices(data_root, "train", transform=aug,                      num_classes=num_classes)
-    ds_va = OASISKerasSlices(data_root, "val",   transform=make_tensor_augment(img_size), num_classes=num_classes)
+# ======================================================
+#  数据加载（自动识别 Keras 切片 或 images/masks+txt）
+# ======================================================
+def _list_png(dir_path):
+    names = []
+    if os.path.isdir(dir_path):
+        for n in os.listdir(dir_path):
+            if n.endswith(".png"):
+                names.append(n)
+    return sorted(names)
 
-    print(f"[Info] data_root={data_root}")
-    print(f"[Info] train samples={len(ds_tr)}, val samples={len(ds_va)}")
+def _pair_names(img_dir, msk_dir):
+    a = set(_list_png(img_dir))
+    b = set(_list_png(msk_dir))
+    both = sorted(list(a.intersection(b)))
+    if len(both) == 0:
+        raise RuntimeError(f"[E] 未找到同名成对 PNG：\n  images={img_dir}\n  masks={msk_dir}")
+    return both
 
-    if len(ds_tr) == 0:
-        raise RuntimeError("[E] 训练集为空，请检查数据路径与目录结构是否为 keras_png_slices_*")
+class _OASIS_Keras_DS(Dataset):
+    # 仅在检测到 keras_png_slices_* 结构时使用
+    def __init__(self, img_dir, msk_dir, num_classes=2):
+        self.img_dir = img_dir
+        self.msk_dir = msk_dir
+        self.num_classes = num_classes
+        self.names = _pair_names(img_dir, msk_dir)
+    def __len__(self): return len(self.names)
+    def __getitem__(self, idx):
+        name = self.names[idx]
+        ip = os.path.join(self.img_dir, name)
+        mp = os.path.join(self.msk_dir, name)
+        img = np.array(Image.open(ip)).astype(np.float32)   # (H,W)
+        msk = np.array(Image.open(mp)).astype(np.int64)     # (H,W)
+        # Z-score
+        m, s = float(img.mean()), float(img.std() + 1e-6)
+        img = (img - m) / s
+        # 二类：0/255 -> 0/1（非零即1）
+        if self.num_classes == 2:
+            msk = (msk > 0).astype(np.int64)
+        img = torch.from_numpy(img).unsqueeze(0)            # [1,H,W]
+        msk = torch.from_numpy(msk)                         # [H,W]
+        return img, msk
+
+def _read_lines(p):
+    out = []
+    if os.path.isfile(p):
+        with open(p, "r") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    out.append(s)
+    return out
+
+class OASIS2DSeg(Dataset):
+    """
+    传统布局：
+      data_root/
+        images/*.png 或 .npy
+        masks/*.png  或 .npy
+        train.txt / val.txt  （文件名不含扩展名）
+    """
+    def __init__(self, root, ids, num_classes=2):
+        self.root = root
+        self.ids = ids
+        self.num_classes = num_classes
+        self.dir_images = os.path.join(root, "images")
+        self.dir_masks = os.path.join(root, "masks")
+
+    def _path(self, base, d):
+        p_png = os.path.join(d, base + ".png")
+        if os.path.isfile(p_png):
+            return p_png, "png"
+        p_npy = os.path.join(d, base + ".npy")
+        if os.path.isfile(p_npy):
+            return p_npy, "npy"
+        raise FileNotFoundError(f"[E] 未找到样本：{base} 于 {d} (.png/.npy)")
+
+    def __len__(self): return len(self.ids)
+
+    def __getitem__(self, idx):
+        bid = self.ids[idx]
+        ip, itype = self._path(bid, self.dir_images)
+        mp, mtype = self._path(bid, self.dir_masks)
+
+        if itype == "png":
+            img = np.array(Image.open(ip)).astype(np.float32)
+        else:
+            img = np.load(ip).astype(np.float32)
+
+        if mtype == "png":
+            msk = np.array(Image.open(mp)).astype(np.int64)
+        else:
+            msk = np.load(mp).astype(np.int64)
+
+        m, s = float(img.mean()), float(img.std() + 1e-6)
+        img = (img - m) / s
+
+        if self.num_classes == 2:
+            if msk.ndim > 2:
+                msk = msk.squeeze()
+            msk = (msk > 0).astype(np.int64)
+
+        img = torch.from_numpy(img).unsqueeze(0)
+        msk = torch.from_numpy(msk)
+        return img, msk
+
+def get_loaders(data_root, num_classes, batch_size, workers, use_channels_last):
+    """
+    自动识别两种布局：
+    A) Keras 切片：
+       data_root/
+         keras_png_slices_train, keras_png_slices_seg_train
+         keras_png_slices_validate, keras_png_slices_seg_validate
+    B) 传统布局：
+       data_root/
+         images/, masks/, train.txt, val.txt
+    """
+    keras_train     = os.path.join(data_root, "keras_png_slices_train")
+    keras_train_seg = os.path.join(data_root, "keras_png_slices_seg_train")
+    keras_val       = os.path.join(data_root, "keras_png_slices_validate")
+    keras_val_seg   = os.path.join(data_root, "keras_png_slices_seg_validate")
+
+    if os.path.isdir(keras_train) and os.path.isdir(keras_train_seg) and \
+       os.path.isdir(keras_val)   and os.path.isdir(keras_val_seg):
+        ds_tr = _OASIS_Keras_DS(keras_train, keras_train_seg, num_classes=num_classes)
+        ds_va = _OASIS_Keras_DS(keras_val,   keras_val_seg,   num_classes=num_classes)
+        print(f"[Keras] train={len(ds_tr)}  val={len(ds_va)}  root={data_root}")
+        if len(ds_tr) == 0:
+            raise RuntimeError("[E] Keras 切片训练集为空，请检查目录与权限。")
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,
+                           num_workers=workers, pin_memory=True, drop_last=True)
+        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False,
+                           num_workers=workers, pin_memory=True)
+        return dl_tr, dl_va
+
+    images = os.path.join(data_root, "images")
+    masks  = os.path.join(data_root, "masks")
+    tr_txt = os.path.join(data_root, "train.txt")
+    va_txt = os.path.join(data_root, "val.txt")
+    if not (os.path.isdir(images) and os.path.isdir(masks)):
+        raise FileNotFoundError(f"[E] 未检测到 Keras 结构，也未找到 images/ 与 masks/：{data_root}")
+
+    ids_tr = _read_lines(tr_txt)
+    ids_va = _read_lines(va_txt)
+    if len(ids_tr) == 0 or len(ids_va) == 0:
+        raise RuntimeError(f"[E] train.txt/val.txt 为空或缺失：\n{tr_txt}\n{va_txt}")
+
+    ds_tr = OASIS2DSeg(data_root, ids_tr, num_classes=num_classes)
+    ds_va = OASIS2DSeg(data_root, ids_va, num_classes=num_classes)
+    print(f"[Legacy] train={len(ds_tr)}  val={len(ds_va)}  root={data_root}")
 
     dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,
                        num_workers=workers, pin_memory=True, drop_last=True)
@@ -249,34 +289,31 @@ def get_loaders(data_root, num_classes, batch_size, workers, use_channels_last, 
     return dl_tr, dl_va
 
 
-# ---------------------------
-#  主函数（while 驱动 epoch）
-# ---------------------------
+# =========================
+#  主训练流程
+# =========================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data_root', type=str, required=True,
-                    help='例如 /home/groups/comp3710/OASIS')
+    ap.add_argument('--data_root', type=str, required=True, help='数据根目录（自动识别 Keras 或 Legacy 布局）')
+    ap.add_argument('--num_classes', type=int, default=2)
     ap.add_argument('--epochs', type=int, default=100)
     ap.add_argument('--batch_size', type=int, default=8)
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--lr', type=float, default=0.05)
-    ap.add_argument('--wd', type=float, default=1e-4)
     ap.add_argument('--warmup', type=int, default=5)
-    ap.add_argument('--num_classes', type=int, default=2)
-    ap.add_argument('--img_size', type=int, default=256)
     ap.add_argument('--no_amp', action='store_true')
     ap.add_argument('--no_channels_last', action='store_true')
-    ap.add_argument('--outdir', type=str, default='./runs_unet_keras')
+    ap.add_argument('--save_dir', type=str, default='./runs_unet_part4')
     args = ap.parse_args()
 
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(args.save_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cudnn.benchmark = True
 
     train_loader, val_loader = get_loaders(args.data_root, args.num_classes,
                                            args.batch_size, args.workers,
-                                           not args.no_channels_last, img_size=args.img_size)
+                                           not args.no_channels_last)
 
     model = UNet(in_ch=1, n_classes=args.num_classes).to(device)
     if not args.no_channels_last:
@@ -284,7 +321,7 @@ def main():
 
     criterion = DiceCELoss(args.num_classes, ce_weight=None, dice_weight=1.0, ce_weight_lambda=1.0)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
-                                weight_decay=args.wd, nesterov=True)
+                                weight_decay=1e-4, nesterov=True)
     scheduler = WarmupCosine(optimizer, warmup_epochs=args.warmup, max_epochs=args.epochs)
 
     scaler = torch.amp.GradScaler('cuda', enabled=not args.no_amp)
@@ -319,12 +356,11 @@ def main():
         cur_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {ep}/{args.epochs} | LR: {cur_lr:.5f} | Val mDSC: {val_dice:.4f}")
 
-        # 保存最好模型与少量可视化
+        # 保存最好模型与 2 张叠图
         if val_dice > best_dice:
             best_dice = val_dice
             torch.save({'state_dict': model.state_dict(), 'dice': best_dice},
-                       os.path.join(args.outdir, 'best_unet.pth'))
-            # 保存 2 个样本的叠图
+                       os.path.join(args.save_dir, 'best_unet.pth'))
             model.eval()
             saved = 0
             with torch.no_grad():
@@ -336,7 +372,7 @@ def main():
                     i = 0
                     while i < bsz:
                         save_overlay(x[i].float().cpu(), pred[i].cpu(), y[i].cpu(),
-                                     os.path.join(args.outdir, f'viz_ep{ep}_{saved}.png'))
+                                     os.path.join(args.save_dir, f'viz_ep{ep}_{saved}.png'))
                         saved += 1
                         i += 1
                         if saved >= 2:
@@ -350,7 +386,7 @@ def main():
     print(f"Total Train Time: {time.time() - t0:.1f}s")
 
     torch.save({'state_dict': model.state_dict(), 'dice': best_dice},
-               os.path.join(args.outdir, 'last_unet.pth'))
+               os.path.join(args.save_dir, 'last_unet.pth'))
 
 
 if __name__ == '__main__':
