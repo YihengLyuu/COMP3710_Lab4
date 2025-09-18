@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
 
+
 # -----------------------
 #   数据集
 # -----------------------
@@ -21,27 +22,28 @@ class OasisSlices(Dataset):
         return len(self.img_paths)
 
     def _load_png(self, pth):
-        # 读灰度
-        img = Image.open(pth).convert("L")
+        img = Image.open(pth).convert("L")  # 灰度
         if self.img_size > 0:
             img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
-        arr = np.asarray(img, dtype=np.uint8)
+        # 用 np.array(..., copy=True) 直接得到可写数组；等价于 np.asarray(...).copy()
+        arr = np.array(img, dtype=np.uint8, copy=True)
         return arr
 
     def _load_mask(self, pth):
         msk = Image.open(pth)
         if self.img_size > 0:
             msk = msk.resize((self.img_size, self.img_size), Image.NEAREST)
-        arr = np.asarray(msk, dtype=np.int64)  # 标签 id
+        arr = np.array(msk, dtype=np.int64, copy=True)
         return arr
 
     def __getitem__(self, idx):
         x = self._load_png(self.img_paths[idx])
         y = self._load_mask(self.mask_paths[idx])
-        # 归一化到[0,1]，再标准化（简单起见，仅/255）
-        x = torch.from_numpy(x.copy()).float().unsqueeze(0) / 255.0
-        y = torch.from_numpy(y.copy()).long()
+        # .copy() 已经做过，这里 from_numpy 就不会触发只读警告
+        x = torch.from_numpy(x).float().unsqueeze(0) / 255.0   # [1,H,W]
+        y = torch.from_numpy(y).long()                         # [H,W]
         return x, y
+
 
 # -----------------------
 #   UNet（简洁实现）
@@ -57,10 +59,12 @@ class ConvBNReLU(nn.Module):
             nn.BatchNorm2d(cout),
             nn.ReLU(inplace=True),
         )
-    def forward(self, x): return self.block(x)
+
+    def forward(self, x):
+        return self.block(x)
 
 class UNet(nn.Module):
-    def __init__(self, in_ch=1, num_classes=4, base=32):
+    def __init__(self, in_ch=1, num_classes=5, base=32):
         super().__init__()
         self.enc1 = ConvBNReLU(in_ch, base)
         self.pool1 = nn.MaxPool2d(2)
@@ -111,46 +115,61 @@ class UNet(nn.Module):
         logits = self.head(d1)  # [N,C,H,W]
         return logits
 
-# -----------------------
-#   Dice（逐类）与混合损失
-# -----------------------
-def one_hot(mask, num_classes):
-    # mask:[N,H,W] -> [N,C,H,W]
-    return torch.nn.functional.one_hot(mask, num_classes).permute(0,3,1,2).float()
 
-def dice_per_class(logits, target, eps=1e-6):
-    # logits: [N,C,H,W], target:[N,H,W]
+# -----------------------
+#   Dice（忽略像素版）与混合损失
+# -----------------------
+def dice_per_class(logits, target, ignore_index=255, eps=1e-6):
+    """
+    logits: [N,C,H,W]
+    target: [N,H,W], 像素值 in {0..C-1} 或 ignore_index(=255)
+    """
     N, C, H, W = logits.shape
-    prob = torch.softmax(logits, dim=1)
-    tgt = one_hot(target, C)
-    dims = (0,2,3)
-    inter = torch.sum(prob * tgt, dim=dims)
+    prob = torch.softmax(logits, dim=1)          # [N,C,H,W]
+
+    valid = (target != ignore_index)             # [N,H,W]
+    if not valid.any():
+        return torch.zeros(C, device=logits.device, dtype=logits.dtype)
+
+    # 将忽略像素暂时置 0（不会被 valid 计入统计）
+    t = target.clone()
+    t[~valid] = 0
+    tgt = torch.nn.functional.one_hot(t, C).permute(0, 3, 1, 2).float()  # [N,C,H,W]
+
+    valid = valid.unsqueeze(1).float()           # [N,1,H,W]
+    prob = prob * valid
+    tgt  = tgt  * valid
+
+    dims = (0, 2, 3)
+    inter = torch.sum(prob * tgt, dim=dims)      # [C]
     denom = torch.sum(prob, dim=dims) + torch.sum(tgt, dim=dims)
-    dsc = (2*inter + eps) / (denom + eps)   # [C]
+    dsc = (2 * inter + eps) / (denom + eps)      # [C]
     return dsc
 
 class CELossDiceMix(nn.Module):
-    def __init__(self, ce_w=1.0, dice_w=1.0):
+    def __init__(self, ce_w=1.0, dice_w=1.0, ignore_index=255):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
         self.ce_w = ce_w
         self.dice_w = dice_w
+        self.ignore_index = ignore_index
+
     def forward(self, logits, target):
         ce = self.ce(logits, target)
-        dsc = dice_per_class(logits, target).mean()
-        return self.ce_w*ce + self.dice_w*(1.0 - dsc)
+        dsc = dice_per_class(logits, target, ignore_index=self.ignore_index).mean()
+        return self.ce_w * ce + self.dice_w * (1.0 - dsc)
+
 
 # -----------------------
-#   评估（每类 DSC）
+#   评估（每类 DSC + 可视化）
 # -----------------------
 @torch.no_grad()
-def evaluate(model, loader, device, save_dir=None, max_vis=6):
+def evaluate(model, loader, device, save_dir=None, max_vis=6, ignore_index=255):
     model.eval()
     total_c = None
     count = 0
     saved = 0
 
-    # 创建可视化目录
     if save_dir is not None:
         os.makedirs(os.path.join(save_dir, "viz"), exist_ok=True)
 
@@ -159,37 +178,36 @@ def evaluate(model, loader, device, save_dir=None, max_vis=6):
         y = y.to(device, non_blocking=True)
 
         logits = model(x)
-        dsc_c = dice_per_class(logits, y)   # [C]
+        dsc_c = dice_per_class(logits, y, ignore_index=ignore_index)  # [C]
         if total_c is None:
             total_c = torch.zeros_like(dsc_c)
         total_c += dsc_c
         count += 1
 
-        # 可视化若干张
         if save_dir is not None and saved < max_vis:
             prob = torch.softmax(logits, dim=1)
             pred = prob.argmax(1)  # [N,H,W]
             n = pred.size(0)
             i = 0
             while i < n and saved < max_vis:
-                # 保存 3 张：原图、GT、Pred
                 out_dir = os.path.join(save_dir, "viz")
                 os.makedirs(out_dir, exist_ok=True)
                 base = f"sample_{saved:02d}"
-                # x[i] -> [1,H,W], 反归一化到[0,255]
-                xi = (x[i,0].detach().float().cpu().clamp(0,1)*255).to(torch.uint8).numpy()
+
+                xi = (x[i, 0].detach().float().cpu().clamp(0, 1) * 255).to(torch.uint8).numpy()
                 yi = y[i].detach().cpu().numpy().astype(np.uint8)
                 pi = pred[i].detach().cpu().numpy().astype(np.uint8)
 
-                Image.fromarray(xi).save(os.path.join(out_dir, base+"_img.png"))
-                Image.fromarray(yi).save(os.path.join(out_dir, base+"_gt.png"))
-                Image.fromarray(pi).save(os.path.join(out_dir, base+"_pred.png"))
+                Image.fromarray(xi).save(os.path.join(out_dir, base + "_img.png"))
+                Image.fromarray(yi).save(os.path.join(out_dir, base + "_gt.png"))
+                Image.fromarray(pi).save(os.path.join(out_dir, base + "_pred.png"))
                 saved += 1
                 i += 1
 
-    mean_c = (total_c / max(count,1)).detach().cpu().numpy()
+    mean_c = (total_c / max(count, 1)).detach().cpu().numpy()
     mean_dsc = float(mean_c.mean())
     return mean_c, mean_dsc
+
 
 # -----------------------
 #   主函数
@@ -199,14 +217,15 @@ def main():
     ap.add_argument('--data_root', type=str, required=True)
     ap.add_argument('--save_dir', type=str, default='./runs_unet_oasis')
     ap.add_argument('--img_size', type=int, default=160)
-    ap.add_argument('--num_classes', type=int, default=4)
-    ap.add_argument('--epochs', type=int, default=50)
+    ap.add_argument('--num_classes', type=int, default=5)  # ← OASIS 常见为 5（0..4）
+    ap.add_argument('--epochs', type=int, default=3)       # a100-test 10min 预算
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--num_workers', type=int, default=8)
+    ap.add_argument('--num_workers', type=int, default=4)
     ap.add_argument('--amp', action='store_true')
     ap.add_argument('--channels_last', action='store_true')
     ap.add_argument('--val_interval', type=int, default=1)
+    ap.add_argument('--ignore_index', type=int, default=255)
     args = ap.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -214,7 +233,6 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cudnn.benchmark = True
 
-    # 路径
     tr_img = os.path.join(args.data_root, "keras_png_slices_train")
     tr_msk = os.path.join(args.data_root, "keras_png_slices_seg_train")
     va_img = os.path.join(args.data_root, "keras_png_slices_validate")
@@ -222,7 +240,6 @@ def main():
     te_img = os.path.join(args.data_root, "keras_png_slices_test")
     te_msk = os.path.join(args.data_root, "keras_png_slices_seg_test")
 
-    # DataLoader
     ds_tr = OasisSlices(tr_img, tr_msk, img_size=args.img_size)
     ds_va = OasisSlices(va_img, va_msk, img_size=args.img_size)
     ds_te = OasisSlices(te_img, te_msk, img_size=args.img_size)
@@ -234,13 +251,11 @@ def main():
     dl_te = DataLoader(ds_te, batch_size=32, shuffle=False,
                        num_workers=args.num_workers, pin_memory=True)
 
-    # Model
     model = UNet(in_ch=1, num_classes=args.num_classes, base=32).to(device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
-    # Loss & Optim
-    criterion = CELossDiceMix(ce_w=1.0, dice_w=1.0)
+    criterion = CELossDiceMix(ce_w=1.0, dice_w=1.0, ignore_index=args.ignore_index)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
@@ -251,7 +266,6 @@ def main():
     ep = 1
     t0 = time.time()
 
-    # 训练循环（不用 range）
     while ep <= args.epochs:
         model.train()
         for x, y in dl_tr:
@@ -264,38 +278,53 @@ def main():
             optim.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=args.amp):
                 logits = model(x)
+
+                # 首次做标签范围检查，快速定位异常值（含 255）
+                if not hasattr(model, "_checked_labels"):
+                    uvals = torch.unique(y).detach().cpu().tolist()
+                    C = int(logits.shape[1])
+                    print(f"[Label Check] unique labels in batch: {uvals}, num_classes={C}, ignore_index={args.ignore_index}")
+                    bad = [v for v in uvals if (v != args.ignore_index and (v < 0 or v >= C))]
+                    if len(bad) > 0:
+                        raise ValueError(
+                            f"Found out-of-range labels {bad}; please set --num_classes >= max(label)+1 "
+                            f"or remap labels / set ignore_index correctly."
+                        )
+                    model._checked_labels = True
+
                 loss = criterion(logits, y)
+
             scaler.scale(loss).backward()
             scaler.step(optim)
             scaler.update()
 
-        # 验证
         if args.val_interval > 0 and (ep % args.val_interval == 0):
-            m_c, m = evaluate(model, dl_va, device, save_dir=None)
+            m_c, m = evaluate(model, dl_va, device, save_dir=None,
+                              max_vis=0, ignore_index=args.ignore_index)
             print(f"[Val] Epoch {ep} | meanDSC={m:.4f} | per-class={np.round(m_c,4)}")
             if m > best_val:
                 best_val = m
-                torch.save({'state_dict': model.state_dict()}, os.path.join(args.save_dir, 'best.pth'))
+                torch.save({'state_dict': model.state_dict()},
+                           os.path.join(args.save_dir, 'best.pth'))
                 print("Saved best ->", os.path.join(args.save_dir, 'best.pth'))
-
         ep += 1
 
-    # 最终测试 + 可视化
+    # 测试 + 可视化
     ckpt_pth = os.path.join(args.save_dir, 'best.pth')
     if os.path.isfile(ckpt_pth):
         sd = torch.load(ckpt_pth, map_location='cpu')['state_dict']
         model.load_state_dict(sd)
         print("Loaded best for test:", ckpt_pth)
 
-    m_c, m = evaluate(model, dl_te, device, save_dir=args.save_dir, max_vis=9)
+    m_c, m = evaluate(model, dl_te, device, save_dir=args.save_dir,
+                      max_vis=9, ignore_index=args.ignore_index)
     dt = time.time() - t0
     print(f"[Test] meanDSC={m:.4f} | per-class={np.round(m_c,4)}")
     print(f"Total Time: {dt/60:.1f} min")
 
-    # 导出
     torch.save({'state_dict': model.state_dict()}, os.path.join(args.save_dir, 'final.pth'))
     print("Saved final ->", os.path.join(args.save_dir, 'final.pth'))
 
+
 if __name__ == "__main__":
     main()
-
