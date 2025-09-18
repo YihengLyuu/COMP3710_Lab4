@@ -1,203 +1,159 @@
-#!/usr/bin/env python3
-# Minimal VAE for OASIS (PyTorch) + sampling + optional UMAP
-# Formats: .npy  or .nii/.nii.gz
-import os, glob, sys
-import numpy as np
+# vae_oasis_min.py
+import os, glob, argparse, numpy as np
+from PIL import Image
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import save_image
+from torchvision.utils import make_grid, save_image
+import matplotlib.pyplot as plt
 
-# ==== 可选：支持 NIfTI ====
-try:
-    import nibabel as nib
-except ImportError:
-    nib = None
+# ---------- 数据集（最小实现） ----------
+IMG_EXTS = (".png", ".jpg", ".jpeg")
+def list_files(root):
+    fs = []
+    for ext in IMG_EXTS + (".npy",):
+        fs += glob.glob(os.path.join(root, "**", f"*{ext}"), recursive=True)
+    return sorted(fs)
 
-# ---------------- Config ----------------
-DATA_ROOT = os.environ.get("OASIS_PATH", "/home/groups/comp3710/")
-OUT_DIR   = os.environ.get("OUT_DIR", "./out_vae")
-IMG_SIZE  = 128
-LATENT_D  = 16
-BATCH     = 64
-EPOCHS    = 10
-LR        = 1e-3
-SEED      = 42
-NUM_WORK  = 4
+class MRIDataset(Dataset):
+    def __init__(self, root, size=128, max_files=None):
+        self.size = size
+        self.files = list_files(root)
+        if max_files: self.files = self.files[:max_files]
 
-os.makedirs(OUT_DIR, exist_ok=True)
-torch.manual_seed(SEED)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def __len__(self): return len(self.files)
 
-# -------------- Dataset --------------
-class Oasis2D(Dataset):
-    def __init__(self, root, img_size=128):
-        self.paths = sorted(
-            glob.glob(os.path.join(root, "**/*.npy"), recursive=True) +
-            glob.glob(os.path.join(root, "**/*.nii"), recursive=True) +
-            glob.glob(os.path.join(root, "**/*.nii.gz"), recursive=True)
-        )
-        if not self.paths:
-            raise RuntimeError(f"No .npy/.nii(.gz) found under {root}")
-        self.img_size = img_size
-
-    def _load_arr(self, p):
-        if p.endswith(".npy"):
-            arr = np.load(p)
-        else:
-            if nib is None:
-                raise RuntimeError("Please `pip install nibabel` to read .nii/.gz files.")
-            arr = nib.load(p).get_fdata()
+    def _resize01(self, arr):
         arr = arr.astype(np.float32)
+        if arr.max() > 0: arr = arr / arr.max()
+        t = torch.from_numpy(arr)[None, None, ...]  # [1,1,H,W]
+        t = F.interpolate(t, size=(self.size, self.size), mode="bilinear", align_corners=False)
+        return t[0]  # [1,S,S]
 
-        # 3D -> 2D: 取中间切片；2D 保持不变
-        if arr.ndim == 3:
-            arr = arr[:, :, arr.shape[2] // 2]
-        if arr.max() > 1.0 or arr.min() < 0.0:
-            m, M = arr.min(), arr.max()
-            arr = (arr - m) / (M - m + 1e-8)
-        return arr  # [H,W], [0,1]
+    def __getitem__(self, i):
+        p = self.files[i].lower()
+        if p.endswith(".npy"):
+            arr = np.load(self.files[i], allow_pickle=False)
+            arr = np.squeeze(arr)
+            if arr.ndim == 3:  # (D,H,W) 取中间切片
+                arr = arr[arr.shape[0] // 2]
+            x = self._resize01(arr)
+        else:
+            img = Image.open(self.files[i]).convert("L").resize((self.size, self.size), Image.BILINEAR)
+            x = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)[None, ...]
+        return x  # [1,S,S]
 
-    def __len__(self): return len(self.paths)
-
-    def __getitem__(self, idx):
-        x = self._load_arr(self.paths[idx])
-        x = torch.from_numpy(x)[None, ...]  # [1,H,W]
-        # 统一尺寸，用双线性插值
-        x = F.interpolate(x[None], size=(self.img_size, self.img_size),
-                          mode="bilinear", align_corners=False)[0]
-        return x, 0
-
-# -------------- VAE --------------
-class Encoder(nn.Module):
-    def __init__(self, zdim=16):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(True),  # 128->64
-            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(True), # 64->32
-            nn.Conv2d(64,128, 4, 2, 1), nn.ReLU(True), # 32->16
-            nn.Conv2d(128,256,4, 2, 1), nn.ReLU(True)  # 16->8
-        )
-        self.fc_mu    = nn.Linear(256*8*8, zdim)
-        self.fc_logv  = nn.Linear(256*8*8, zdim)
-
-    def forward(self, x):
-        h = self.conv(x)
-        h = h.flatten(1)
-        return self.fc_mu(h), self.fc_logv(h)
-
-class Decoder(nn.Module):
-    def __init__(self, zdim=16):
-        super().__init__()
-        self.fc = nn.Linear(zdim, 256*8*8)
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256,128,4,2,1), nn.ReLU(True), # 8->16
-            nn.ConvTranspose2d(128,64, 4,2,1), nn.ReLU(True), # 16->32
-            nn.ConvTranspose2d(64, 32, 4,2,1), nn.ReLU(True), # 32->64
-            nn.ConvTranspose2d(32, 1,  4,2,1), nn.Sigmoid()   # 64->128
-        )
-
-    def forward(self, z):
-        h = self.fc(z).view(-1,256,8,8)
-        return self.deconv(h)
-
+# ---------- 极简 VAE（2D 潜在） ----------
 class VAE(nn.Module):
-    def __init__(self, zdim=16):
+    def __init__(self, size=128, zdim=2):
         super().__init__()
-        self.enc, self.dec = Encoder(zdim), Decoder(zdim)
+        c = 32; s8 = size // 8
+        self.enc = nn.Sequential(
+            nn.Conv2d(1, c, 4, 2, 1), nn.ReLU(True),        # S/2
+            nn.Conv2d(c, c*2, 4, 2, 1), nn.ReLU(True),      # S/4
+            nn.Conv2d(c*2, c*4, 4, 2, 1), nn.ReLU(True)     # S/8
+        )
+        self.fc_mu  = nn.Linear(c*4*s8*s8, zdim)
+        self.fc_log = nn.Linear(c*4*s8*s8, zdim)
+        self.fc_dec = nn.Linear(zdim, c*4*s8*s8)
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(c*4, c*2, 4, 2, 1), nn.ReLU(True),  # S/4
+            nn.ConvTranspose2d(c*2, c,   4, 2, 1), nn.ReLU(True),  # S/2
+            nn.ConvTranspose2d(c, 1,     4, 2, 1), nn.Sigmoid()    # S
+        )
+        self.size, self.zdim, self._c4, self._s8 = size, zdim, c*4, s8
 
-    def reparam(self, mu, logv):
-        std = torch.exp(0.5*logv)
-        return mu + std*torch.randn_like(std)
+    def encode(self, x):
+        h = self.enc(x).flatten(1)
+        return self.fc_mu(h), self.fc_log(h)
+
+    def reparam(self, mu, logvar):
+        std = torch.exp(0.5*logvar); eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decode(self, z):
+        h = self.fc_dec(z).view(-1, self._c4, self._s8, self._s8)
+        return self.dec(h)
 
     def forward(self, x):
-        mu, logv = self.enc(x)
-        z = self.reparam(mu, logv)
-        xr = self.dec(z)
-        return xr, mu, logv, z
+        mu, logvar = self.encode(x)
+        z = self.reparam(mu, logvar)
+        xhat = self.decode(z)
+        return xhat, mu, logvar, z
 
-def loss_fn(xr, x, mu, logv):
-    rec = F.binary_cross_entropy(xr, x, reduction="sum") / x.size(0)
-    kld = -0.5 * torch.sum(1 + logv - mu.pow(2) - logv.exp()) / x.size(0)
-    return rec + kld, rec, kld
+def kld(mu, logvar):
+    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-# -------------- Train + Visualize --------------
-def main(data_root):
-    ds = Oasis2D(data_root, IMG_SIZE)
-    n  = len(ds)
-    tr = int(0.9*n)
-    g  = torch.Generator().manual_seed(SEED)
-    dtr, dva = torch.utils.data.random_split(ds, [tr, n-tr], generator=g)
+# ---------- 可视化（重建 / 潜在散点 / 网格采样） ----------
+@torch.no_grad()
+def viz_recon(model, loader, out, tag="ep"):
+    x = next(iter(loader))[:64].to(next(model.parameters()).device)
+    xhat, *_ = model(x)
+    save_image(make_grid(torch.cat([x, xhat], 0), nrow=8, pad_value=1.0), f"{out}/recon_{tag}.png")
 
-    dl_tr = DataLoader(dtr, batch_size=BATCH, shuffle=True,  num_workers=NUM_WORK, pin_memory=True)
-    dl_va = DataLoader(dva, batch_size=BATCH, shuffle=False, num_workers=NUM_WORK, pin_memory=True)
+@torch.no_grad()
+def viz_scatter(model, loader, out):
+    zs = []
+    for x in loader:
+        x = x.to(next(model.parameters()).device)
+        mu, _ = model.encode(x)
+        zs.append(mu.cpu().numpy())
+        if sum(len(a) for a in zs) > 5000: break
+    Z = np.concatenate(zs, 0)
+    plt.figure(figsize=(5,5))
+    plt.scatter(Z[:,0], Z[:,1], s=3, alpha=0.6)
+    plt.title("Latent (mu)"); plt.xlabel("z1"); plt.ylabel("z2")
+    plt.tight_layout(); plt.savefig(f"{out}/latent_scatter.png", dpi=200); plt.close()
 
-    vae = VAE(LATENT_D).to(device)
-    opt = torch.optim.Adam(vae.parameters(), lr=LR)
+@torch.no_grad()
+def viz_grid(model, out, steps=20, lim=3.0):
+    if model.zdim != 2: return
+    xs = torch.linspace(-lim, lim, steps)
+    z = torch.stack([torch.stack([x.repeat(steps), xs]) for x in xs], 0).reshape(2, -1).t().to(next(model.parameters()).device)
+    xg = model.decode(z).cpu()
+    save_image(make_grid(xg, nrow=steps, pad_value=1.0), f"{out}/latent_grid_{steps}x{steps}.png")
 
-    best = 1e9
-    for e in range(1, EPOCHS+1):
-        vae.train(); s = 0.0
-        for x,_ in dl_tr:
+# ---------- 训练入口（最小参数集） ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, default="/home/groups/comp3710")
+    ap.add_argument("--size", type=int, default=128)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--beta", type=float, default=1.0)
+    ap.add_argument("--out", type=str, default="./vae_out")
+    ap.add_argument("--max_files", type=int, default=None)
+    args = ap.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    full = MRIDataset(args.data, size=args.size, max_files=args.max_files)
+    n = len(full); n_tr = max(1, int(0.9*n)); n_va = n - n_tr
+    tr, va = torch.utils.data.random_split(full, [n_tr, n_va], generator=torch.Generator().manual_seed(42))
+    tl = DataLoader(tr, batch_size=args.batch, shuffle=True,  num_workers=4, pin_memory=True, drop_last=True)
+    vl = DataLoader(va, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = VAE(size=args.size, zdim=2).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    for ep in range(1, args.epochs+1):
+        model.train()
+        loss_sum = 0.0
+        for x in tl:
             x = x.to(device, non_blocking=True)
-            xr, mu, logv, _ = vae(x)
-            L, rec, kld = loss_fn(xr, x, mu, logv)
-            opt.zero_grad(); L.backward(); opt.step()
-            s += L.item()*x.size(0)
-        tr_loss = s / tr
+            xhat, mu, logvar, _ = model(x)
+            recon = F.mse_loss(xhat, x)
+            loss = recon + args.beta * kld(mu, logvar)
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+            loss_sum += loss.item() * x.size(0)
+        print(f"Epoch {ep}/{args.epochs} | loss={loss_sum/len(tr):.5f}")
+        viz_recon(model, vl, args.out, tag=f"{ep:03d}")
 
-        vae.eval(); s = 0.0
-        with torch.no_grad():
-            for x,_ in dl_va:
-                x = x.to(device)
-                xr, mu, logv, _ = vae(x)
-                L, _, _ = loss_fn(xr, x, mu, logv)
-                s += L.item()*x.size(0)
-        va_loss = s / (n - tr)
-        print(f"[{e}/{EPOCHS}] train={tr_loss:.4f} val={va_loss:.4f}")
-
-        if va_loss < best:
-            best = va_loss
-            torch.save(vae.state_dict(), os.path.join(OUT_DIR, "vae_best.pt"))
-
-    # ---- Recon Grid ----
-    vae.load_state_dict(torch.load(os.path.join(OUT_DIR, "vae_best.pt"), map_location=device))
-    vae.eval()
-    x,_ = next(iter(dl_va))
-    x = x.to(device)
-    with torch.no_grad():
-        xr, _, _, _ = vae(x)
-    grid = torch.cat([x[:8], xr[:8]], dim=0).cpu()  # 原图+重建
-    save_image(grid, os.path.join(OUT_DIR, "recon_grid.png"), nrow=8)
-
-    # ---- Random Samples ----
-    with torch.no_grad():
-        z = torch.randn(64, LATENT_D, device=device)
-        xs = vae.dec(z).cpu()
-    save_image(xs, os.path.join(OUT_DIR, "samples_grid.png"), nrow=8)
-
-    # ---- UMAP (optional) ----
-    try:
-        import umap, matplotlib.pyplot as plt
-        Z = []
-        with torch.no_grad():
-            for i,(xb,_) in enumerate(dl_va):
-                xb = xb.to(device)
-                _, _, _, zb = vae(xb)
-                Z.append(zb.cpu())
-                if i >= 20: break
-        Z = torch.cat(Z, 0).numpy()
-        U = umap.UMAP(random_state=SEED).fit_transform(Z)
-        plt.figure(figsize=(5,5)); plt.scatter(U[:,0], U[:,1], s=5, alpha=0.7)
-        plt.title("VAE Latent Manifold (UMAP)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(OUT_DIR, "umap_latent.png"), dpi=200)
-        plt.close()
-    except Exception as e:
-        print("Skip UMAP:", e)
-
-    print("Done. Outputs ->", OUT_DIR)
+    torch.save({"state_dict": model.state_dict(), "size": args.size}, f"{args.out}/vae.pth")
+    viz_grid(model, args.out, steps=20, lim=3.0)
+    viz_scatter(model, vl, args.out)
+    print("Saved: vae.pth, recon_*.png, latent_grid_*.png, latent_scatter.png")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        DATA_ROOT = sys.argv[1]
-    main(DATA_ROOT)
+    main()
