@@ -9,37 +9,56 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # -----------------------
-#   数据集
+#   数据集（含调色板重映射）
 # -----------------------
 class OasisSlices(Dataset):
-    def __init__(self, img_dir, mask_dir, img_size=160):
+    def __init__(self, img_dir, mask_dir, img_size=160, ignore_index=255):
         self.img_paths = sorted(glob.glob(os.path.join(img_dir, "*.png")))
         self.mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))
         assert len(self.img_paths) == len(self.mask_paths), "images/masks count mismatch"
         self.img_size = int(img_size)
+        self.ignore_index = int(ignore_index)
+        # 常见 OASIS 预处理切片调色板：0/85/170 为有效类；255 为忽略
+        self.fixed_palette = {0: 0, 85: 1, 170: 2}
 
     def __len__(self):
         return len(self.img_paths)
 
     def _load_png(self, pth):
-        img = Image.open(pth).convert("L")  # 灰度
+        img = Image.open(pth).convert("L")
         if self.img_size > 0:
             img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
-        # 用 np.array(..., copy=True) 直接得到可写数组；等价于 np.asarray(...).copy()
-        arr = np.array(img, dtype=np.uint8, copy=True)
-        return arr
+        return np.array(img, dtype=np.uint8, copy=True)
 
     def _load_mask(self, pth):
         msk = Image.open(pth)
         if self.img_size > 0:
             msk = msk.resize((self.img_size, self.img_size), Image.NEAREST)
-        arr = np.array(msk, dtype=np.int64, copy=True)
-        return arr
+        return np.array(msk, dtype=np.int64, copy=True)
+
+    def _remap_mask(self, arr: np.ndarray) -> np.ndarray:
+        """将调色板值重映射为连续类 id；255 保持忽略。"""
+        uvals = np.unique(arr)
+        # 情形 A：恰好是 0/85/170/255
+        if np.isin(uvals, [0, 85, 170, self.ignore_index]).all():
+            out = np.full_like(arr, fill_value=self.ignore_index)
+            for k, v in self.fixed_palette.items():
+                out[arr == k] = v
+            out[arr == self.ignore_index] = self.ignore_index
+            return out
+        # 情形 B：其它离散调色板 —— 自动从小到大映射到 0..K-1（排除 ignore）
+        valid = [int(v) for v in uvals if v != self.ignore_index]
+        lut = {val: i for i, val in enumerate(sorted(valid))}
+        out = np.full_like(arr, fill_value=self.ignore_index)
+        for val, i in lut.items():
+            out[arr == val] = i
+        return out
 
     def __getitem__(self, idx):
         x = self._load_png(self.img_paths[idx])
         y = self._load_mask(self.mask_paths[idx])
-        # .copy() 已经做过，这里 from_numpy 就不会触发只读警告
+        y = self._remap_mask(y)  # ★ 关键：重映射到连续类 id
+
         x = torch.from_numpy(x).float().unsqueeze(0) / 255.0   # [1,H,W]
         y = torch.from_numpy(y).long()                         # [H,W]
         return x, y
@@ -59,12 +78,10 @@ class ConvBNReLU(nn.Module):
             nn.BatchNorm2d(cout),
             nn.ReLU(inplace=True),
         )
-
-    def forward(self, x):
-        return self.block(x)
+    def forward(self, x): return self.block(x)
 
 class UNet(nn.Module):
-    def __init__(self, in_ch=1, num_classes=5, base=32):
+    def __init__(self, in_ch=1, num_classes=3, base=32):
         super().__init__()
         self.enc1 = ConvBNReLU(in_ch, base)
         self.pool1 = nn.MaxPool2d(2)
@@ -93,27 +110,13 @@ class UNet(nn.Module):
         e2 = self.enc2(self.pool1(e1))
         e3 = self.enc3(self.pool2(e2))
         e4 = self.enc4(self.pool3(e3))
-
         b  = self.bott(self.pool4(e4))
 
-        d4 = self.up4(b)
-        d4 = torch.cat([d4, e4], dim=1)
-        d4 = self.dec4(d4)
-
-        d3 = self.up3(d4)
-        d3 = torch.cat([d3, e3], dim=1)
-        d3 = self.dec3(d3)
-
-        d2 = self.up2(d3)
-        d2 = torch.cat([d2, e2], dim=1)
-        d2 = self.dec2(d2)
-
-        d1 = self.up1(d2)
-        d1 = torch.cat([d1, e1], dim=1)
-        d1 = self.dec1(d1)
-
-        logits = self.head(d1)  # [N,C,H,W]
-        return logits
+        d4 = self.up4(b); d4 = torch.cat([d4, e4], dim=1); d4 = self.dec4(d4)
+        d3 = self.up3(d4); d3 = torch.cat([d3, e3], dim=1); d3 = self.dec3(d3)
+        d2 = self.up2(d3); d2 = torch.cat([d2, e2], dim=1); d2 = self.dec2(d2)
+        d1 = self.up1(d2); d1 = torch.cat([d1, e1], dim=1); d1 = self.dec1(d1)
+        return self.head(d1)  # [N,C,H,W]
 
 
 # -----------------------
@@ -153,7 +156,6 @@ class CELossDiceMix(nn.Module):
         self.ce_w = ce_w
         self.dice_w = dice_w
         self.ignore_index = ignore_index
-
     def forward(self, logits, target):
         ce = self.ce(logits, target)
         dsc = dice_per_class(logits, target, ignore_index=self.ignore_index).mean()
@@ -217,8 +219,8 @@ def main():
     ap.add_argument('--data_root', type=str, required=True)
     ap.add_argument('--save_dir', type=str, default='./runs_unet_oasis')
     ap.add_argument('--img_size', type=int, default=160)
-    ap.add_argument('--num_classes', type=int, default=5)  # ← OASIS 常见为 5（0..4）
-    ap.add_argument('--epochs', type=int, default=3)       # a100-test 10min 预算
+    ap.add_argument('--num_classes', type=int, default=3)   # ★ 匹配 0/85/170 → 0/1/2
+    ap.add_argument('--epochs', type=int, default=3)        # a100-test 10min 预算
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--num_workers', type=int, default=4)
@@ -240,9 +242,9 @@ def main():
     te_img = os.path.join(args.data_root, "keras_png_slices_test")
     te_msk = os.path.join(args.data_root, "keras_png_slices_seg_test")
 
-    ds_tr = OasisSlices(tr_img, tr_msk, img_size=args.img_size)
-    ds_va = OasisSlices(va_img, va_msk, img_size=args.img_size)
-    ds_te = OasisSlices(te_img, te_msk, img_size=args.img_size)
+    ds_tr = OasisSlices(tr_img, tr_msk, img_size=args.img_size, ignore_index=args.ignore_index)
+    ds_va = OasisSlices(va_img, va_msk, img_size=args.img_size, ignore_index=args.ignore_index)
+    ds_te = OasisSlices(te_img, te_msk, img_size=args.img_size, ignore_index=args.ignore_index)
 
     dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True,
                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -279,7 +281,7 @@ def main():
             with torch.amp.autocast('cuda', enabled=args.amp):
                 logits = model(x)
 
-                # 首次做标签范围检查，快速定位异常值（含 255）
+                # 首次做标签范围检查（重映射后应为 {0..C-1, ignore}）
                 if not hasattr(model, "_checked_labels"):
                     uvals = torch.unique(y).detach().cpu().tolist()
                     C = int(logits.shape[1])
@@ -287,8 +289,8 @@ def main():
                     bad = [v for v in uvals if (v != args.ignore_index and (v < 0 or v >= C))]
                     if len(bad) > 0:
                         raise ValueError(
-                            f"Found out-of-range labels {bad}; please set --num_classes >= max(label)+1 "
-                            f"or remap labels / set ignore_index correctly."
+                            f"Found out-of-range labels {bad}; after remap this should not happen. "
+                            f"Check palette → class-id mapping or increase --num_classes."
                         )
                     model._checked_labels = True
 
