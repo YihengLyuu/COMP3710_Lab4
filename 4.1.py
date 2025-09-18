@@ -75,59 +75,67 @@ class UNet(nn.Module):
 
 
 # =========================
-#  Dice + CE 复合损失 & 评估
+#  Dice + CE 复合损失（按类Dice，默认忽略背景）
 # =========================
 class DiceCELoss(nn.Module):
-    def __init__(self, num_classes, ce_weight=None, dice_weight=1.0, ce_weight_lambda=1.0):
+    def __init__(self, num_classes, ce_weight=None, dice_weight=1.0, ce_weight_lambda=1.0,
+                 ignore_bg=True, eps=1e-6):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(weight=ce_weight)
         self.num_classes = num_classes
         self.dw = dice_weight
         self.cw = ce_weight_lambda
+        self.ignore_bg = ignore_bg
+        self.eps = eps
 
     def forward(self, logits, target):
         ce = self.ce(logits, target)
-        probs = torch.softmax(logits, dim=1)
-        onehot = F.one_hot(target.clamp(min=0), self.num_classes).permute(0, 3, 1, 2).float()
-        inter = (probs * onehot).sum(dim=(0, 2, 3)).sum()
-        denom = (probs + onehot).sum(dim=(0, 2, 3)).sum()
-        dice = 1.0 - (2 * inter + 1e-6) / (denom + 1e-6)
+        probs = torch.softmax(logits, dim=1)                          # [N,C,H,W]
+        onehot = F.one_hot(target.clamp(min=0), self.num_classes)     # [N,H,W,C]
+        onehot = onehot.permute(0, 3, 1, 2).float()                   # [N,C,H,W]
+
+        inter = (probs * onehot).sum(dim=(0, 2, 3))                   # [C]
+        denom = (probs + onehot).sum(dim=(0, 2, 3))                   # [C]
+        dice_c = (2 * inter + self.eps) / (denom + self.eps)          # [C]
+        if self.ignore_bg and self.num_classes > 1:
+            dice_c = dice_c[1:]
+        dice = 1.0 - dice_c.mean()
         return self.cw * ce + self.dw * dice
 
-@torch.no_grad()
-def dice_per_class(logits, target, num_classes, eps=1e-6):
-    probs = torch.softmax(logits, dim=1)
-    onehot = F.one_hot(target.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
-    inter = (probs * onehot).sum(dim=(0, 2, 3))
-    denom = (probs + onehot).sum(dim=(0, 2, 3))
-    return (2 * inter + eps) / (denom + eps)
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_classes):
+def evaluate(model, loader, device, num_classes, ignore_bg=True, eps=1e-6):
+    """全验证集累计（macro Dice，可忽略背景）"""
     model.eval()
-    dices = torch.zeros(num_classes, device=device)
-    count = 0
+    inter_sum = torch.zeros(num_classes, device=device)
+    denom_sum = torch.zeros(num_classes, device=device)
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         logits = model(x)
-        dices += dice_per_class(logits, y, num_classes)
-        count += 1
-    return (dices / max(count, 1)).mean().item()
+        probs = torch.softmax(logits, dim=1)                          # [N,C,H,W]
+        onehot = F.one_hot(y.clamp(min=0), num_classes).permute(0, 3, 1, 2).float()
+        inter_sum += (probs * onehot).sum(dim=(0, 2, 3))
+        denom_sum += (probs + onehot).sum(dim=(0, 2, 3))
+    dice_c = (2 * inter_sum + eps) / (denom_sum + eps)
+    if ignore_bg and num_classes > 1:
+        dice_c = dice_c[1:]
+    return dice_c.mean().item()
 
 
 # =========================
-#  可视化：叠图保存
+#  可视化：叠图保存（vmax 对齐 GT/Pred）
 # =========================
 def save_overlay(x, y_pred, y_true, out_png):
     x = x.squeeze(0).cpu().numpy()
     y_pred = y_pred.cpu().numpy()
     y_true = y_true.cpu().numpy()
+    vmax = int(max(np.max(y_true), np.max(y_pred))) if (y_true.size and y_pred.size) else 1
     import matplotlib.pyplot as plt
     plt.figure(figsize=(10, 3))
     plt.subplot(1, 3, 1); plt.imshow(x, cmap='gray'); plt.title('Image'); plt.axis('off')
-    plt.subplot(1, 3, 2); plt.imshow(y_true, vmin=0, vmax=y_pred.max()); plt.title('GT'); plt.axis('off')
-    plt.subplot(1, 3, 3); plt.imshow(y_pred, vmin=0, vmax=y_pred.max()); plt.title('Pred'); plt.axis('off')
+    plt.subplot(1, 3, 2); plt.imshow(y_true, vmin=0, vmax=vmax); plt.title('GT'); plt.axis('off')
+    plt.subplot(1, 3, 3); plt.imshow(y_pred, vmin=0, vmax=vmax); plt.title('Pred'); plt.axis('off')
     plt.tight_layout(); plt.savefig(out_png, dpi=180); plt.close()
 
 
@@ -167,9 +175,11 @@ class _OASIS_Keras_DS(Dataset):
         # Z-score
         m, s = float(img.mean()), float(img.std() + 1e-6)
         img = (img - m) / s
-        # 二类：0/255 -> 0/1（非零即1）
+        # mask 归一：二类→二值；多类→截断到合法范围
         if self.num_classes == 2:
             msk = (msk > 0).astype(np.int64)
+        else:
+            msk = np.clip(msk, 0, self.num_classes - 1).astype(np.int64)
         img = torch.from_numpy(img).unsqueeze(0)            # [1,H,W]
         msk = torch.from_numpy(msk)                         # [H,W]
         return img, msk
@@ -232,6 +242,10 @@ class OASIS2DSeg(Dataset):
             if msk.ndim > 2:
                 msk = msk.squeeze()
             msk = (msk > 0).astype(np.int64)
+        else:
+            if msk.ndim > 2:
+                msk = msk.squeeze()
+            msk = np.clip(msk, 0, self.num_classes - 1).astype(np.int64)
 
         img = torch.from_numpy(img).unsqueeze(0)
         msk = torch.from_numpy(msk)
@@ -306,6 +320,11 @@ def main():
     ap.add_argument('--save_dir', type=str, default='./runs_unet_part4')
     args = ap.parse_args()
 
+    # 复现性
+    torch.manual_seed(42); np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
     os.makedirs(args.save_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -319,11 +338,14 @@ def main():
     if not args.no_channels_last:
         model = model.to(memory_format=torch.channels_last)
 
-    criterion = DiceCELoss(args.num_classes, ce_weight=None, dice_weight=1.0, ce_weight_lambda=1.0)
+    criterion = DiceCELoss(args.num_classes, ce_weight=None, dice_weight=1.0,
+                           ce_weight_lambda=1.0, ignore_bg=True)
+
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9,
                                 weight_decay=1e-4, nesterov=True)
     scheduler = WarmupCosine(optimizer, warmup_epochs=args.warmup, max_epochs=args.epochs)
 
+    # 按你的要求：保持原 AMP 写法不改动
     scaler = torch.amp.GradScaler('cuda', enabled=not args.no_amp)
     autocast = torch.amp.autocast('cuda', enabled=not args.no_amp)
 
@@ -335,6 +357,8 @@ def main():
 
     while ep <= args.epochs:
         model.train()
+        loss_sum, n_batches = 0.0, 0
+
         for x, y in train_loader:
             if not args.no_channels_last:
                 x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -350,17 +374,27 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
+            loss_sum += loss.detach().float().item()
+            n_batches += 1
+
         scheduler.step()
 
-        val_dice = evaluate(model, val_loader, device, args.num_classes)
-        cur_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {ep}/{args.epochs} | LR: {cur_lr:.5f} | Val mDSC: {val_dice:.4f}")
+        val_dice = evaluate(model, val_loader, device, args.num_classes, ignore_bg=True)
+        cur_lr = scheduler.get_last_lr()[0]
+        tr_loss = loss_sum / max(n_batches, 1)
+        print(f"Epoch {ep}/{args.epochs} | LR: {cur_lr:.5f} | Train Loss: {tr_loss:.4f} | Val mDSC: {val_dice:.4f}")
 
         # 保存最好模型与 2 张叠图
         if val_dice > best_dice:
             best_dice = val_dice
-            torch.save({'state_dict': model.state_dict(), 'dice': best_dice},
-                       os.path.join(args.save_dir, 'best_unet.pth'))
+            torch.save({
+                'state_dict': model.state_dict(),
+                'opt': optimizer.state_dict(),
+                'sched': scheduler.state_dict(),
+                'dice': best_dice,
+                'epoch': ep
+            }, os.path.join(args.save_dir, 'best_unet.pth'))
+
             model.eval()
             saved = 0
             with torch.no_grad():
@@ -385,8 +419,13 @@ def main():
     print(f"Best Val mDSC: {best_dice:.4f}")
     print(f"Total Train Time: {time.time() - t0:.1f}s")
 
-    torch.save({'state_dict': model.state_dict(), 'dice': best_dice},
-               os.path.join(args.save_dir, 'last_unet.pth'))
+    torch.save({
+        'state_dict': model.state_dict(),
+        'opt': optimizer.state_dict(),
+        'sched': scheduler.state_dict(),
+        'dice': best_dice,
+        'epoch': ep
+    }, os.path.join(args.save_dir, 'last_unet.pth'))
 
 
 if __name__ == '__main__':
