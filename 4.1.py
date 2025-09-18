@@ -1,4 +1,3 @@
-# vae_oasis_min.py
 import os, glob, argparse, numpy as np
 from PIL import Image
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -25,7 +24,7 @@ class MRIDataset(Dataset):
     def _resize01(self, arr):
         arr = arr.astype(np.float32)
         if arr.max() > 0: arr = arr / arr.max()
-        t = torch.from_numpy(arr)[None, None, ...]  # [1,1,H,W]
+        t = torch.from_numpy(arr)[None, None, ...]
         t = F.interpolate(t, size=(self.size, self.size), mode="bilinear", align_corners=False)
         return t[0]  # [1,S,S]
 
@@ -34,13 +33,13 @@ class MRIDataset(Dataset):
         if p.endswith(".npy"):
             arr = np.load(self.files[i], allow_pickle=False)
             arr = np.squeeze(arr)
-            if arr.ndim == 3:  # (D,H,W) 取中间切片
+            if arr.ndim == 3:  
                 arr = arr[arr.shape[0] // 2]
             x = self._resize01(arr)
         else:
             img = Image.open(self.files[i]).convert("L").resize((self.size, self.size), Image.BILINEAR)
             x = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)[None, ...]
-        return x  # [1,S,S]
+        return x  
 
 # ---------- 极简 VAE（2D 潜在） ----------
 class VAE(nn.Module):
@@ -48,17 +47,17 @@ class VAE(nn.Module):
         super().__init__()
         c = 32; s8 = size // 8
         self.enc = nn.Sequential(
-            nn.Conv2d(1, c, 4, 2, 1), nn.ReLU(True),        # S/2
-            nn.Conv2d(c, c*2, 4, 2, 1), nn.ReLU(True),      # S/4
-            nn.Conv2d(c*2, c*4, 4, 2, 1), nn.ReLU(True)     # S/8
+            nn.Conv2d(1, c, 4, 2, 1), nn.ReLU(True),        
+            nn.Conv2d(c, c*2, 4, 2, 1), nn.ReLU(True),      
+            nn.Conv2d(c*2, c*4, 4, 2, 1), nn.ReLU(True)     
         )
         self.fc_mu  = nn.Linear(c*4*s8*s8, zdim)
         self.fc_log = nn.Linear(c*4*s8*s8, zdim)
         self.fc_dec = nn.Linear(zdim, c*4*s8*s8)
         self.dec = nn.Sequential(
-            nn.ConvTranspose2d(c*4, c*2, 4, 2, 1), nn.ReLU(True),  # S/4
-            nn.ConvTranspose2d(c*2, c,   4, 2, 1), nn.ReLU(True),  # S/2
-            nn.ConvTranspose2d(c, 1,     4, 2, 1), nn.Sigmoid()    # S
+            nn.ConvTranspose2d(c*4, c*2, 4, 2, 1), nn.ReLU(True),  
+            nn.ConvTranspose2d(c*2, c,   4, 2, 1), nn.ReLU(True),  
+            nn.ConvTranspose2d(c, 1,     4, 2, 1), nn.Sigmoid()    
         )
         self.size, self.zdim, self._c4, self._s8 = size, zdim, c*4, s8
 
@@ -157,3 +156,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
