@@ -39,8 +39,8 @@ class OasisSlices(Dataset):
         x = self._load_png(self.img_paths[idx])
         y = self._load_mask(self.mask_paths[idx])
         # 归一化到[0,1]，再标准化（简单起见，仅/255）
-        x = torch.from_numpy(x).float().unsqueeze(0) / 255.0  # [1,H,W]
-        y = torch.from_numpy(y).long()                        # [H,W]
+        x = torch.from_numpy(x.copy()).float().unsqueeze(0) / 255.0
+        y = torch.from_numpy(y.copy()).long()
         return x, y
 
 # -----------------------
@@ -242,7 +242,7 @@ def main():
     # Loss & Optim
     criterion = CELossDiceMix(ce_w=1.0, dice_w=1.0)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.amp)
 
     print(f"Device={device}, AMP={args.amp}, channels_last={args.channels_last}")
     print(f"Epochs={args.epochs}, BatchSize={args.batch_size}, LR={args.lr}, Img={args.img_size}, C={args.num_classes}")
@@ -262,7 +262,7 @@ def main():
             y = y.to(device, non_blocking=True)
 
             optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=args.amp):
+            with torch.amp.autocast('cuda', enabled=args.amp):
                 logits = model(x)
                 loss = criterion(logits, y)
             scaler.scale(loss).backward()
@@ -298,3 +298,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
