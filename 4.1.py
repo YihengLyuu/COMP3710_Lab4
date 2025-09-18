@@ -1,159 +1,187 @@
-import os, glob, argparse, numpy as np
+import os, time, math, glob, numpy as np
 from PIL import Image
-import torch, torch.nn as nn, torch.nn.functional as F
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import make_grid, save_image
-import matplotlib.pyplot as plt
+from torchvision import transforms, utils as vutils
 
-# ---------- 数据集（最小实现） ----------
-IMG_EXTS = (".png", ".jpg", ".jpeg")
-def list_files(root):
-    fs = []
-    for ext in IMG_EXTS + (".npy",):
-        fs += glob.glob(os.path.join(root, "**", f"*{ext}"), recursive=True)
-    return sorted(fs)
 
-class MRIDataset(Dataset):
-    def __init__(self, root, size=128, max_files=None):
-        self.size = size
-        self.files = list_files(root)
-        if max_files: self.files = self.files[:max_files]
+# =============== 数据集：递归收集 .npy / .png / .jpg ===============
+class OasisSlices(Dataset):
+    def __init__(self, root, img_size=128):
+        pats = ('*.npy', '*.png', '*.jpg', '*.jpeg')
+        self.files = []
+        i = 0
+        while i < len(pats):
+            self.files += glob.glob(os.path.join(root, '**', pats[i]), recursive=True)
+            i += 1
+        if len(self.files) == 0:
+            raise FileNotFoundError(f'No images under: {root}')
+        self.files.sort()
+        self.size = img_size
+        self.to_tensor = transforms.Compose([
+            transforms.Resize((img_size, img_size), antialias=True),
+            transforms.ToTensor(),  # [0,1], 单通道在下面强制
+        ])
 
     def __len__(self): return len(self.files)
 
-    def _resize01(self, arr):
-        arr = arr.astype(np.float32)
-        if arr.max() > 0: arr = arr / arr.max()
-        t = torch.from_numpy(arr)[None, None, ...]
-        t = F.interpolate(t, size=(self.size, self.size), mode="bilinear", align_corners=False)
-        return t[0]  # [1,S,S]
-
-    def __getitem__(self, i):
-        p = self.files[i].lower()
-        if p.endswith(".npy"):
-            arr = np.load(self.files[i], allow_pickle=False)
-            arr = np.squeeze(arr)
-            if arr.ndim == 3:  
-                arr = arr[arr.shape[0] // 2]
-            x = self._resize01(arr)
+    def __getitem__(self, idx):
+        p = self.files[idx]
+        if p.lower().endswith('.npy'):
+            arr = np.load(p)  # 支持 HxW 或 CxHxW / HxWxC
+            if arr.ndim == 2: arr = arr[None, ...]
+            elif arr.ndim == 3 and arr.shape[0] not in (1, 3) and arr.shape[-1] in (1, 3):
+                arr = np.moveaxis(arr, -1, 0)
+            if arr.shape[0] != 1: arr = arr[:1]
+            x = torch.from_numpy(arr).float()
+            x = x - x.min()
+            x = x / (x.max() + 1e-6)
+            x = torch.nn.functional.interpolate(
+                x.unsqueeze(0), size=(self.size, self.size),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)
+            return x
         else:
-            img = Image.open(self.files[i]).convert("L").resize((self.size, self.size), Image.BILINEAR)
-            x = torch.from_numpy(np.array(img, dtype=np.float32) / 255.0)[None, ...]
-        return x  
+            img = Image.open(p).convert('L')
+            x = self.to_tensor(img)  # 1xHxW
+            return x
 
-# ---------- 极简 VAE（2D 潜在） ----------
+
+# ============================ VAE =============================
 class VAE(nn.Module):
-    def __init__(self, size=128, zdim=2):
+    def __init__(self, z=2):  # 固定 z=2，方便直接画潜在空间网格
         super().__init__()
-        c = 32; s8 = size // 8
         self.enc = nn.Sequential(
-            nn.Conv2d(1, c, 4, 2, 1), nn.ReLU(True),        
-            nn.Conv2d(c, c*2, 4, 2, 1), nn.ReLU(True),      
-            nn.Conv2d(c*2, c*4, 4, 2, 1), nn.ReLU(True)     
+            nn.Conv2d(1, 32, 4, 2, 1), nn.ReLU(True),   # 64
+            nn.Conv2d(32, 64, 4, 2, 1), nn.ReLU(True),  # 32
+            nn.Conv2d(64, 128,4, 2, 1), nn.ReLU(True),  # 16
+            nn.Conv2d(128,256,4, 2, 1), nn.ReLU(True),  # 8
         )
-        self.fc_mu  = nn.Linear(c*4*s8*s8, zdim)
-        self.fc_log = nn.Linear(c*4*s8*s8, zdim)
-        self.fc_dec = nn.Linear(zdim, c*4*s8*s8)
+        self.flat = nn.Flatten()
+        self.fc_mu  = nn.Linear(256*8*8, z)
+        self.fc_lv  = nn.Linear(256*8*8, z)
+        self.fc_up  = nn.Linear(z, 256*8*8)
         self.dec = nn.Sequential(
-            nn.ConvTranspose2d(c*4, c*2, 4, 2, 1), nn.ReLU(True),  
-            nn.ConvTranspose2d(c*2, c,   4, 2, 1), nn.ReLU(True),  
-            nn.ConvTranspose2d(c, 1,     4, 2, 1), nn.Sigmoid()    
+            nn.ConvTranspose2d(256,128,4,2,1), nn.ReLU(True),   # 16
+            nn.ConvTranspose2d(128,64,4,2,1),  nn.ReLU(True),   # 32
+            nn.ConvTranspose2d(64,32,4,2,1),   nn.ReLU(True),   # 64
+            nn.ConvTranspose2d(32,1,4,2,1),    nn.Sigmoid()     # 128
         )
-        self.size, self.zdim, self._c4, self._s8 = size, zdim, c*4, s8
 
     def encode(self, x):
-        h = self.enc(x).flatten(1)
-        return self.fc_mu(h), self.fc_log(h)
+        h = self.enc(x)
+        h = self.flat(h)
+        return self.fc_mu(h), self.fc_lv(h)
 
-    def reparam(self, mu, logvar):
-        std = torch.exp(0.5*logvar); eps = torch.randn_like(std)
-        return mu + eps*std
+    def reparam(self, mu, lv):
+        std = torch.exp(0.5*lv)
+        return mu + torch.randn_like(std) * std
 
     def decode(self, z):
-        h = self.fc_dec(z).view(-1, self._c4, self._s8, self._s8)
+        h = self.fc_up(z).view(-1, 256, 8, 8)
         return self.dec(h)
 
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparam(mu, logvar)
-        xhat = self.decode(z)
-        return xhat, mu, logvar, z
+        mu, lv = self.encode(x)
+        z = self.reparam(mu, lv)
+        xrec = self.decode(z)
+        return xrec, mu, lv
 
-def kld(mu, logvar):
-    return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-# ---------- 可视化（重建 / 潜在散点 / 网格采样） ----------
+# ====================== 可视化（重建 & 流形） ======================
 @torch.no_grad()
-def viz_recon(model, loader, out, tag="ep"):
-    x = next(iter(loader))[:64].to(next(model.parameters()).device)
-    xhat, *_ = model(x)
-    save_image(make_grid(torch.cat([x, xhat], 0), nrow=8, pad_value=1.0), f"{out}/recon_{tag}.png")
-
-@torch.no_grad()
-def viz_scatter(model, loader, out):
-    zs = []
-    for x in loader:
-        x = x.to(next(model.parameters()).device)
-        mu, _ = model.encode(x)
-        zs.append(mu.cpu().numpy())
-        if sum(len(a) for a in zs) > 5000: break
-    Z = np.concatenate(zs, 0)
-    plt.figure(figsize=(5,5))
-    plt.scatter(Z[:,0], Z[:,1], s=3, alpha=0.6)
-    plt.title("Latent (mu)"); plt.xlabel("z1"); plt.ylabel("z2")
-    plt.tight_layout(); plt.savefig(f"{out}/latent_scatter.png", dpi=200); plt.close()
+def save_recon(model, batch, out_png):
+    model.eval()
+    x = batch[:64]
+    xrec, _, _ = model(x)
+    grid = vutils.make_grid(torch.cat([x, xrec], 0), nrow=8, padding=2)
+    vutils.save_image(grid, out_png)
+    print(f'[viz] recon -> {out_png}')
 
 @torch.no_grad()
-def viz_grid(model, out, steps=20, lim=3.0):
-    if model.zdim != 2: return
-    xs = torch.linspace(-lim, lim, steps)
-    z = torch.stack([torch.stack([x.repeat(steps), xs]) for x in xs], 0).reshape(2, -1).t().to(next(model.parameters()).device)
-    xg = model.decode(z).cpu()
-    save_image(make_grid(xg, nrow=steps, pad_value=1.0), f"{out}/latent_grid_{steps}x{steps}.png")
+def save_manifold(model, device, out_png, grid_n=10):
+    # 仅 z=2 时生效：在 [-3,3]^2 均匀采样并解码
+    xs = torch.linspace(-3, 3, steps=grid_n, device=device)
+    ys = torch.linspace(-3, 3, steps=grid_n, device=device)
+    X, Y = torch.meshgrid(xs, ys, indexing='xy')
+    Z = torch.stack([X.reshape(-1), Y.reshape(-1)], 1)  # (N,2)
+    imgs, i, N, bs = [], 0, Z.size(0), 64
+    autocast = torch.amp.autocast('cuda', enabled=torch.cuda.is_available())
+    while i < N:
+        j = min(i+bs, N)
+        with autocast:
+            dec = model.decode(Z[i:j]).float().cpu()
+        imgs.append(dec)
+        i = j
+    imgs = torch.cat(imgs, 0)
+    grid = vutils.make_grid(imgs, nrow=grid_n, padding=2)
+    vutils.save_image(grid, out_png)
+    print(f'[viz] manifold -> {out_png}')
 
-# ---------- 训练入口（最小参数集） ----------
+
+# ============================ 训练 =============================
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default="/home/groups/comp3710")
-    ap.add_argument("--size", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--batch", type=int, default=128)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--beta", type=float, default=1.0)
-    ap.add_argument("--out", type=str, default="./vae_out")
-    ap.add_argument("--max_files", type=int, default=None)
-    args = ap.parse_args()
+    # 极简参数（其余都内置默认）
+    data_dir = os.environ.get('OASIS_DIR', '/home/groups/comp3710/OASIS')  # 如路径不同，改成课程给的实际路径
+    epochs   = int(os.environ.get('EPOCHS', '40'))
+    bsz      = int(os.environ.get('BATCH',  '128'))
+    workers  = int(os.environ.get('WORKERS','4'))
+    img_size = int(os.environ.get('SIZE',   '128'))
+    beta     = float(os.environ.get('BETA', '1.0'))    # KL 权重（beta-VAE 可调）
 
-    os.makedirs(args.out, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cudnn.benchmark = True
 
-    full = MRIDataset(args.data, size=args.size, max_files=args.max_files)
-    n = len(full); n_tr = max(1, int(0.9*n)); n_va = n - n_tr
-    tr, va = torch.utils.data.random_split(full, [n_tr, n_va], generator=torch.Generator().manual_seed(42))
-    tl = DataLoader(tr, batch_size=args.batch, shuffle=True,  num_workers=4, pin_memory=True, drop_last=True)
-    vl = DataLoader(va, batch_size=args.batch, shuffle=False, num_workers=4, pin_memory=True)
+    ds = OasisSlices(data_dir, img_size=img_size)
+    loader = DataLoader(ds, batch_size=bsz, shuffle=True,
+                        num_workers=workers, pin_memory=True, drop_last=True)
 
-    model = VAE(size=args.size, zdim=2).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    model = VAE(z=2).to(device)  # 固定 z=2 便于直接可视化潜在空间
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    bce = nn.BCELoss(reduction='sum')
 
-    for ep in range(1, args.epochs+1):
+    scaler  = torch.amp.GradScaler('cuda', enabled=True)
+    autocast = torch.amp.autocast('cuda', enabled=True)
+
+    print(f'Device={device} | Samples={len(ds)} | Epochs={epochs} | Batch={bsz} | Size={img_size} | beta={beta}')
+
+    t0, ep = time.time(), 1
+    while ep <= epochs:
         model.train()
-        loss_sum = 0.0
-        for x in tl:
+        tot_rec, tot_kl, tot_cnt = 0.0, 0.0, 0
+        for x in loader:
             x = x.to(device, non_blocking=True)
-            xhat, mu, logvar, _ = model(x)
-            recon = F.mse_loss(xhat, x)
-            loss = recon + args.beta * kld(mu, logvar)
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-            loss_sum += loss.item() * x.size(0)
-        print(f"Epoch {ep}/{args.epochs} | loss={loss_sum/len(tr):.5f}")
-        viz_recon(model, vl, args.out, tag=f"{ep:03d}")
+            opt.zero_grad(set_to_none=True)
+            with autocast:
+                xrec, mu, lv = model(x)
+                rec = bce(xrec, x)                                   # 重建
+                kl  = -0.5 * torch.sum(1 + lv - mu.pow(2) - lv.exp())# KL
+                loss = rec + beta * kl
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            tot_rec += rec.item(); tot_kl += kl.item(); tot_cnt += x.size(0)
 
-    torch.save({"state_dict": model.state_dict(), "size": args.size}, f"{args.out}/vae.pth")
-    viz_grid(model, args.out, steps=20, lim=3.0)
-    viz_scatter(model, vl, args.out)
-    print("Saved: vae.pth, recon_*.png, latent_grid_*.png, latent_scatter.png")
+        # 打印 epoch 级别指标（把 BCE 平均到每像素上以便直观）
+        avg_rec = tot_rec / (tot_cnt * img_size * img_size)
+        avg_kl  = tot_kl  /  tot_cnt
+        print(f'Epoch {ep}/{epochs} | rec(BCE/pixel): {avg_rec:.5f} | KL/img: {avg_kl:.3f}')
+        ep += 1
 
-if __name__ == "__main__":
+        # 简单可视化（当前 loader 的一个 batch）
+        try:
+            save_recon(model, next(iter(loader)).to(device), out_png=f'recon_ep{ep-1}.png')
+            save_manifold(model, device, out_png=f'manifold_ep{ep-1}.png', grid_n=10)
+        except Exception as e:
+            print('[viz] skip:', e)
+
+    dt = time.time() - t0
+    torch.save({'state_dict': model.state_dict()}, 'vae_oasis_min.pth')
+    print(f'Saved -> vae_oasis_min.pth | Total Train Time: {dt:.1f}s')
+
+
+if __name__ == '__main__':
     main()
-
