@@ -1,0 +1,88 @@
+C:\Users\ALIENWARE\miniconda3\envs\torch\python.exe C:\Users\ALIENWARE\Desktop\demo2\4.train_unet_oasis.py
+Device=cuda, AMP=False, channels_last=False
+Epochs=30, BatchSize=16, LR=0.0005, Img=160, C=3, base=48
+[Label Check] unique labels in batch: [0, 1, 2, 255], num_classes=3, ignore_index=255
+[Val] Epoch 1 | meanDSC=0.9381 | per-class=[0.9955 0.8631 0.9558]
+[WARN] some classes < 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 2 | meanDSC=0.9545 | per-class=[0.998  0.8994 0.9662]
+[WARN] some classes < 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 3 | meanDSC=0.9568 | per-class=[0.9985 0.9059 0.9659]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 4 | meanDSC=0.9612 | per-class=[0.9987 0.913  0.9718]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 5 | meanDSC=0.9416 | per-class=[0.9989 0.8665 0.9594]
+[WARN] some classes < 0.9
+[Val] Epoch 6 | meanDSC=0.9702 | per-class=[0.9991 0.9338 0.9776]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 7 | meanDSC=0.9708 | per-class=[0.9992 0.9353 0.9779]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 8 | meanDSC=0.9715 | per-class=[0.9992 0.9374 0.978 ]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 9 | meanDSC=0.9714 | per-class=[0.9993 0.9369 0.9782]
+[PASS] all classes > 0.9
+[Val] Epoch 10 | meanDSC=0.9721 | per-class=[0.9993 0.9382 0.979 ]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 11 | meanDSC=0.9744 | per-class=[0.9995 0.9439 0.9799]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 12 | meanDSC=0.9745 | per-class=[0.9995 0.9438 0.9803]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 13 | meanDSC=0.9746 | per-class=[0.9995 0.9438 0.9803]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 14 | meanDSC=0.9748 | per-class=[0.9995 0.9449 0.9801]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 15 | meanDSC=0.9746 | per-class=[0.9995 0.9443 0.98  ]
+[PASS] all classes > 0.9
+[Val] Epoch 16 | meanDSC=0.9738 | per-class=[0.9995 0.9421 0.9798]
+[PASS] all classes > 0.9
+[Val] Epoch 17 | meanDSC=0.9746 | per-class=[0.9995 0.9438 0.9805]
+[PASS] all classes > 0.9
+[Val] Epoch 18 | meanDSC=0.9755 | per-class=[0.9995 0.946  0.9809]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 19 | meanDSC=0.9748 | per-class=[0.9995 0.9443 0.9806]
+[PASS] all classes > 0.9
+[Val] Epoch 20 | meanDSC=0.9754 | per-class=[0.9995 0.9459 0.9807]
+[PASS] all classes > 0.9
+[Val] Epoch 21 | meanDSC=0.9755 | per-class=[0.9995 0.9462 0.9809]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 22 | meanDSC=0.9757 | per-class=[0.9995 0.9463 0.9811]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 23 | meanDSC=0.9756 | per-class=[0.9995 0.9464 0.981 ]
+[PASS] all classes > 0.9
+[Val] Epoch 24 | meanDSC=0.9756 | per-class=[0.9995 0.9464 0.981 ]
+[PASS] all classes > 0.9
+[Val] Epoch 25 | meanDSC=0.9756 | per-class=[0.9995 0.9463 0.9811]
+[PASS] all classes > 0.9
+[Val] Epoch 26 | meanDSC=0.9757 | per-class=[0.9995 0.9464 0.9811]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Val] Epoch 27 | meanDSC=0.9757 | per-class=[0.9995 0.9464 0.9811]
+[PASS] all classes > 0.9
+[Val] Epoch 28 | meanDSC=0.9756 | per-class=[0.9995 0.9462 0.9811]
+[PASS] all classes > 0.9
+[Val] Epoch 29 | meanDSC=0.9756 | per-class=[0.9995 0.9464 0.981 ]
+[PASS] all classes > 0.9
+[Val] Epoch 30 | meanDSC=0.9757 | per-class=[0.9995 0.9465 0.9811]
+[PASS] all classes > 0.9
+Saved best -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+Loaded best for test: C:/Users/ALIENWARE/Desktop/demo2/runs_unet\best.pth
+[Test] meanDSC=0.9764 | per-class=[0.9995 0.9495 0.9801]
+[PASS] all classes > 0.9
+Total Time: 57.7 min
+Saved final -> C:/Users/ALIENWARE/Desktop/demo2/runs_unet\final.pth
+
+Process finished with exit code 0
